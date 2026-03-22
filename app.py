@@ -8,22 +8,21 @@ CORS(app, origins="*")
 DOWNLOAD_DIR = tempfile.mkdtemp()
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
-def ytdlp(extra_args, timeout=20):
-    """Run yt-dlp with base args + extras. Returns (stdout, stderr, returncode)."""
-    args = ['yt-dlp', '--no-warnings', '--no-playlist', '--no-check-certificate',
-            '--concurrent-fragments', '8', '--retries', '3', '--fragment-retries', '3',
-            '--extractor-args', 'youtube:player_client=android,web',
-            '--add-header', 'Accept-Language:en-US,en;q=0.9']
+def base_args():
+    args = [
+        'yt-dlp',
+        '--no-warnings',
+        '--no-playlist',
+        '--no-check-certificate',
+        '--concurrent-fragments', '8',
+        '--retries', '3',
+        '--fragment-retries', '3',
+        '--extractor-args', 'youtube:player_client=android,web',
+        '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    ]
     if os.path.exists(COOKIES_FILE):
         args += ['--cookies', COOKIES_FILE]
-    args += extra_args
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        return r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
-        return '', 'Timeout', 1
-    except Exception as e:
-        return '', str(e), 1
+    return args
 
 def cleanup(path, delay=180):
     def _del():
@@ -39,8 +38,11 @@ def find_newest(ext):
 
 @app.route('/health')
 def health():
-    out, _, _ = ytdlp(['--version'], timeout=5)
-    return jsonify({'status': 'ok', 'yt_dlp': out.strip(), 'cookies': os.path.exists(COOKIES_FILE)})
+    try:
+        v = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True, timeout=5)
+        return jsonify({'status': 'ok', 'yt_dlp': v.stdout.strip(), 'cookies': os.path.exists(COOKIES_FILE)})
+    except:
+        return jsonify({'status': 'ok', 'yt_dlp': 'unknown', 'cookies': os.path.exists(COOKIES_FILE)})
 
 
 @app.route('/api/info', methods=['POST'])
@@ -49,80 +51,70 @@ def get_info():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    # Fast: only fetch title, thumbnail, duration, uploader - takes ~2-3 seconds
-    out, err, code = ytdlp([
-        '--skip-download',
-        '--print', 'title',
-        '--print', 'thumbnail',
-        '--print', 'duration',
-        '--print', 'uploader',
-        url
-    ], timeout=15)
-
-    if code == 0 and out.strip():
-        lines = out.strip().split('\n')
-        try:
+    out, err = '', ''
+    try:
+        r = subprocess.run(
+            base_args() + ['--skip-download', '--print', 'title',
+                           '--print', 'thumbnail', '--print', 'duration',
+                           '--print', 'uploader', url],
+            capture_output=True, text=True, timeout=15
+        )
+        out, err = r.stdout, r.stderr
+        if r.returncode == 0 and out.strip():
+            lines = out.strip().split('\n')
             return jsonify({
                 'title':     lines[0] if len(lines) > 0 else 'Unknown',
                 'thumbnail': lines[1] if len(lines) > 1 else '',
                 'duration':  int(float(lines[2])) if len(lines) > 2 and lines[2].replace('.','').isdigit() else 0,
                 'uploader':  lines[3] if len(lines) > 3 else 'Unknown',
             })
-        except:
-            pass
+    except subprocess.TimeoutExpired:
+        err = 'Timeout - try again'
+    except Exception as e:
+        err = str(e)
 
-    return jsonify({'error': err.strip().split('\n')[-1] if err else 'Failed to fetch info'}), 400
+    return jsonify({'error': err.strip().split('\n')[-1] if err else 'Failed'}), 400
 
 
 @app.route('/api/download', methods=['POST'])
 def download_video():
-    url  = (request.json or {}).get('url', '').strip()
+    url     = (request.json or {}).get('url', '').strip()
     quality = (request.json or {}).get('quality', '1080')
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
     is_mp3 = quality == 'mp3'
     out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
-    height_map = {'1080': 1080, '1440': 1440, '2160': 2160}
 
-    # Build args
-    dl_args = ['--output', out_tmpl, '--print', 'after_move:filepath']
-
+    # Map quality to yt-dlp format - using ONLY -f best style
+    # that NEVER throws format not available
     if is_mp3:
-        dl_args += [
-            '--format', 'bestaudio',
-            '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0',
-        ]
-    else:
-        h = height_map.get(quality, 1080)
-        dl_args += [
-            # -S never throws "format not available" - sorts and picks best match
-            '--format', 'bestvideo+bestaudio/best',
-            '-S', f'res:{h},fps,codec:h264',
-            '--merge-output-format', 'mp4',
-        ]
+        fmt_args = ['-f', 'bestaudio', '-x', '--audio-format', 'mp3', '--audio-quality', '0']
+    elif quality == '2160':
+        fmt_args = ['-f', 'bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best', '--merge-output-format', 'mp4']
+    elif quality == '1440':
+        fmt_args = ['-f', 'bestvideo[height<=1440]+bestaudio/bestvideo+bestaudio/best', '--merge-output-format', 'mp4']
+    elif quality == '1080':
+        fmt_args = ['-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best', '--merge-output-format', 'mp4']
+    else:  # best
+        fmt_args = ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4']
 
-    dl_args.append(url)
-
-    # Try up to 3 times with different player clients
-    clients = ['android,web', 'ios,web', 'tv_embedded,web']
+    clients = ['android,web', 'ios,web', 'tv_embedded,web', 'mweb,android', 'android_vr', 'web']
     last_error = 'Download failed'
 
-    for attempt, client in enumerate(clients):
-        args = ['--no-warnings', '--no-playlist', '--no-check-certificate',
-                '--concurrent-fragments', '8', '--retries', '3', '--fragment-retries', '3',
-                '--extractor-args', f'youtube:player_client={client}',
-                '--add-header', 'Accept-Language:en-US,en;q=0.9']
-        if os.path.exists(COOKIES_FILE):
-            args += ['--cookies', COOKIES_FILE]
-
+    for client in clients:
         try:
-            result = subprocess.run(
-                ['yt-dlp'] + args + dl_args,
-                capture_output=True, text=True, timeout=600
-            )
+            args = base_args()
+            # Override player client per attempt
+            for i, a in enumerate(args):
+                if a == 'youtube:player_client=android,web':
+                    args[i] = f'youtube:player_client={client}'
 
-            # Get filepath
+            args += fmt_args + ['-o', out_tmpl, '--print', 'after_move:filepath', url]
+
+            result = subprocess.run(args, capture_output=True, text=True, timeout=600)
+
+            # find filepath
             filepath = None
             for line in result.stdout.strip().split('\n'):
                 line = line.strip()
@@ -135,6 +127,7 @@ def download_video():
 
             if not filepath or not os.path.exists(filepath):
                 last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'File not found'
+                # If format not available try next client
                 time.sleep(1)
                 continue
 
