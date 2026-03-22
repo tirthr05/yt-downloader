@@ -1,18 +1,64 @@
-from flask import Flask, request, jsonify, send_file, after_this_request
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import yt_dlp
 import os
 import tempfile
 import threading
 import time
+import random
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
 DOWNLOAD_DIR = tempfile.mkdtemp()
 
-def cleanup_file(path, delay=60):
-    """Delete file after delay seconds"""
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+    'com.google.android.youtube/17.36.4 (Linux; U; Android 12) gzip',
+]
+
+# Each attempt uses a different player client strategy
+PLAYER_STRATEGIES = [
+    ['android', 'web'],
+    ['ios', 'web'],
+    ['android_vr'],
+    ['tv_embedded', 'web'],
+    ['mweb', 'android'],
+    ['web_creator', 'android'],
+]
+
+def get_opts(attempt=0):
+    strategy = PLAYER_STRATEGIES[attempt % len(PLAYER_STRATEGIES)]
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        'user_agent': random.choice(USER_AGENTS),
+        'extractor_args': {
+            'youtube': {
+                'player_client': strategy,
+            }
+        },
+        'http_headers': {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Sec-Fetch-Mode': 'navigate',
+        },
+        'retries': 10,
+        'fragment_retries': 10,
+        'sleep_interval': 1,
+        'max_sleep_interval': 4,
+        'ignoreerrors': False,
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
+    }
+
+def cleanup_file(path, delay=120):
     def _delete():
         time.sleep(delay)
         try:
@@ -22,6 +68,11 @@ def cleanup_file(path, delay=60):
     threading.Thread(target=_delete, daemon=True).start()
 
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
+
+
 @app.route('/api/info', methods=['POST'])
 def get_info():
     data = request.json
@@ -29,25 +80,30 @@ def get_info():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    ydl_opts = {'quiet': True, 'no_warnings': True}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return jsonify({
-                'title': info.get('title', 'Unknown'),
-                'thumbnail': info.get('thumbnail', ''),
-                'duration': info.get('duration', 0),
-                'uploader': info.get('uploader', 'Unknown'),
-            })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
+    last_error = None
+    for attempt in range(6):
+        try:
+            ydl_opts = get_opts(attempt)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return jsonify({
+                    'title': info.get('title', 'Unknown'),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'duration': info.get('duration', 0),
+                    'uploader': info.get('uploader', 'Unknown'),
+                })
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(2)
+
+    return jsonify({'error': last_error}), 400
 
 
 @app.route('/api/download', methods=['POST'])
 def download_video():
     data = request.json
     url = data.get('url', '').strip()
-    quality = data.get('quality', '1080')  # '1080', '1440', '2160', 'best', 'mp3'
+    quality = data.get('quality', '1080')
 
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
@@ -55,61 +111,63 @@ def download_video():
     out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
 
     if quality == 'mp3':
-        ydl_opts = {
+        extra = {
             'format': 'bestaudio/best',
             'outtmpl': out_tmpl,
-            'quiet': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '320',
             }],
         }
-        ext = 'mp3'
     else:
         if quality == 'best':
             fmt = 'bestvideo+bestaudio/best'
         else:
-            fmt = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
-
-        ydl_opts = {
+            fmt = (
+                f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
+                f'bestvideo[height<={quality}]+bestaudio/'
+                f'best[height<={quality}]/'
+                f'best'
+            )
+        extra = {
             'format': fmt,
             'outtmpl': out_tmpl,
-            'quiet': True,
             'merge_output_format': 'mp4',
         }
-        ext = 'mp4'
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get('title', 'video')
+    last_error = None
+    for attempt in range(6):
+        try:
+            ydl_opts = {**get_opts(attempt), **extra}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-            # Find the downloaded file
-            safe_title = ydl.prepare_filename(info)
-            # For mp3, extension changes after postprocessing
-            if quality == 'mp3':
-                base = os.path.splitext(safe_title)[0]
-                filepath = base + '.mp3'
-            else:
-                filepath = os.path.splitext(safe_title)[0] + '.mp4'
+                safe_title = ydl.prepare_filename(info)
+                if quality == 'mp3':
+                    filepath = os.path.splitext(safe_title)[0] + '.mp3'
+                else:
+                    filepath = os.path.splitext(safe_title)[0] + '.mp4'
+                    if not os.path.exists(filepath):
+                        filepath = safe_title
+
                 if not os.path.exists(filepath):
-                    filepath = safe_title  # fallback
+                    raise Exception('File not found after download')
 
-            if not os.path.exists(filepath):
-                return jsonify({'error': 'Download failed - file not found'}), 500
+                cleanup_file(filepath, delay=180)
 
-            cleanup_file(filepath, delay=120)
+                return send_file(
+                    filepath,
+                    as_attachment=True,
+                    download_name=os.path.basename(filepath),
+                    mimetype='audio/mpeg' if quality == 'mp3' else 'video/mp4'
+                )
 
-            return send_file(
-                filepath,
-                as_attachment=True,
-                download_name=os.path.basename(filepath),
-                mimetype='audio/mpeg' if quality == 'mp3' else 'video/mp4'
-            )
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(2)
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return jsonify({'error': last_error}), 500
 
 
 if __name__ == '__main__':
