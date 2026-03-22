@@ -13,15 +13,6 @@ PLAYER_CLIENTS = [
     'tv_embedded,web', 'mweb,android', 'web_creator,android',
 ]
 
-# Simple and clean - just get best video up to that height + best audio, always works
-FORMATS = {
-    '1080': 'bestvideo[height<=1080]+bestaudio/best',
-    '1440': 'bestvideo[height<=1440]+bestaudio/best',
-    '2160': 'bestvideo[height<=2160]+bestaudio/best',
-    'best': 'bestvideo+bestaudio/best',
-    'mp3':  'bestaudio/best',
-}
-
 def base_args(attempt=0):
     args = [
         'yt-dlp',
@@ -47,15 +38,19 @@ def cleanup(path, delay=180):
         except: pass
     threading.Thread(target=_del, daemon=True).start()
 
+def find_newest(ext):
+    matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
+    return max(matches, key=os.path.getmtime) if matches else None
+
 
 @app.route('/health')
 def health():
     try:
         v = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True, timeout=5)
-        version = v.stdout.strip()
+        ver = v.stdout.strip()
     except:
-        version = 'not found'
-    return jsonify({'status': 'ok', 'yt_dlp': version, 'cookies': os.path.exists(COOKIES_FILE)})
+        ver = 'not found'
+    return jsonify({'status': 'ok', 'yt_dlp': ver, 'cookies': os.path.exists(COOKIES_FILE)})
 
 
 @app.route('/api/info', methods=['POST'])
@@ -64,7 +59,7 @@ def get_info():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    last_error = 'Failed'
+    last_error = 'Failed to fetch info'
     for attempt in range(6):
         try:
             result = subprocess.run(
@@ -86,7 +81,6 @@ def get_info():
         except Exception as e:
             last_error = str(e)
         time.sleep(1)
-
     return jsonify({'error': last_error}), 400
 
 
@@ -97,27 +91,50 @@ def download_video():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    fmt = FORMATS.get(quality, FORMATS['1080'])
     is_mp3 = quality == 'mp3'
     out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
+
+    # Height targets
+    height_map = {'1080': 1080, '1440': 1440, '2160': 2160}
 
     last_error = 'Download failed'
     for attempt in range(6):
         try:
             args = base_args(attempt) + [
-                '--format', fmt,
                 '--output', out_tmpl,
                 '--print', 'after_move:filepath',
             ]
+
             if is_mp3:
-                args += ['--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0']
+                # Audio only - simple, always works
+                args += [
+                    '--format', 'bestaudio',
+                    '--extract-audio',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '0',
+                ]
+            elif quality == 'best':
+                # Absolute best quality no restrictions
+                args += [
+                    '--format-sort', 'res,fps,codec,br',
+                    '--format', 'bestvideo+bestaudio/best',
+                    '--merge-output-format', 'mp4',
+                ]
             else:
-                args += ['--merge-output-format', 'mp4']
+                h = height_map.get(quality, 1080)
+                # Use -S (sort) flag - most reliable way in yt-dlp
+                # Sorts by: height (capped), then fps, then codec, then bitrate
+                # Never throws format not available
+                args += [
+                    '--format-sort', f'res:{h},fps,codec,br',
+                    '--format', 'bestvideo+bestaudio/best',
+                    '--merge-output-format', 'mp4',
+                ]
 
             args.append(url)
             result = subprocess.run(args, capture_output=True, text=True, timeout=600)
 
-            # get filepath
+            # Get filepath from --print output
             filepath = None
             for line in result.stdout.strip().split('\n'):
                 line = line.strip()
@@ -125,12 +142,9 @@ def download_video():
                     filepath = line
                     break
 
-            # fallback: newest file
+            # Fallback: newest file
             if not filepath:
-                ext = '.mp3' if is_mp3 else '.mp4'
-                matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
-                if matches:
-                    filepath = max(matches, key=os.path.getmtime)
+                filepath = find_newest('.mp3' if is_mp3 else '.mp4')
 
             if not filepath or not os.path.exists(filepath):
                 last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'File not found'
@@ -151,7 +165,7 @@ def download_video():
             def generate(path):
                 with open(path, 'rb') as f:
                     while True:
-                        chunk = f.read(1024 * 1024)
+                        chunk = f.read(1024 * 1024)  # 1MB chunks
                         if not chunk:
                             break
                         yield chunk
