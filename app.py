@@ -8,22 +8,27 @@ CORS(app, origins="*")
 DOWNLOAD_DIR = tempfile.mkdtemp()
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
-def base_args():
+CLIENTS = ['android', 'ios', 'web', 'android_vr', 'tv_embedded', 'mweb']
+
+def base_args(client='android'):
     args = [
         'yt-dlp',
         '--no-warnings',
-        '--no-playlist', 
+        '--no-playlist',
         '--no-check-certificate',
         '--concurrent-fragments', '8',
         '--retries', '3',
         '--fragment-retries', '3',
+        '--extractor-args', f'youtube:player_client={client}',
         '--add-header', 'Accept-Language:en-US,en;q=0.9',
+        '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        '--geo-bypass',
+        '--geo-bypass-country', 'US',
+        '--xff', 'default',
     ]
     if os.path.exists(COOKIES_FILE):
         args += ['--cookies', COOKIES_FILE]
     return args
-
-CLIENTS = ['android', 'ios', 'web', 'android_vr', 'tv_embedded', 'mweb']
 
 def cleanup(path, delay=180):
     def _del():
@@ -52,11 +57,11 @@ def get_info():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
+    last_error = 'Failed'
     for client in CLIENTS:
         try:
             r = subprocess.run(
-                base_args() + [
-                    '--extractor-args', f'youtube:player_client={client}',
+                base_args(client) + [
                     '--skip-download',
                     '--print', 'title',
                     '--print', 'thumbnail',
@@ -64,7 +69,7 @@ def get_info():
                     '--print', 'uploader',
                     url
                 ],
-                capture_output=True, text=True, timeout=12
+                capture_output=True, text=True, timeout=15
             )
             if r.returncode == 0 and r.stdout.strip():
                 lines = r.stdout.strip().split('\n')
@@ -74,11 +79,14 @@ def get_info():
                     'duration':  int(float(lines[2])) if len(lines) > 2 and lines[2].replace('.','').isdigit() else 0,
                     'uploader':  lines[3] if len(lines) > 3 else 'Unknown',
                 })
-        except:
-            pass
-        time.sleep(0.5)
+            if r.stderr:
+                last_error = r.stderr.strip().split('\n')[-1]
+        except subprocess.TimeoutExpired:
+            last_error = 'Timeout'
+        except Exception as e:
+            last_error = str(e)
 
-    return jsonify({'error': 'Could not fetch video info. Check the URL and try again.'}), 400
+    return jsonify({'error': last_error}), 400
 
 
 @app.route('/api/download', methods=['POST'])
@@ -96,14 +104,12 @@ def download_video():
 
     for client in CLIENTS:
         try:
-            args = base_args() + [
-                '--extractor-args', f'youtube:player_client={client}',
+            args = base_args(client) + [
                 '--output', out_tmpl,
                 '--print', 'after_move:filepath',
             ]
 
             if is_mp3:
-                # Audio only - dead simple, always works
                 args += [
                     '--format', 'bestaudio/best',
                     '--extract-audio',
@@ -111,19 +117,15 @@ def download_video():
                     '--audio-quality', '0',
                 ]
             else:
-                # bestvideo*+bestaudio* with wildcard covers ALL video types
-                # Multiple fallbacks guarantee something always downloads
                 args += [
                     '--format',
-                    f'bestvideo*[height<={height}]+bestaudio*/bestvideo[height<={height}]+bestaudio/bestvideo*+bestaudio*/best[height<={height}]/best',
+                    f'bestvideo*[height<={height}]+bestaudio*/bestvideo[height<={height}]+bestaudio/bestvideo*+bestaudio*/best',
                     '--merge-output-format', 'mp4',
                 ]
 
             args.append(url)
-
             result = subprocess.run(args, capture_output=True, text=True, timeout=600)
 
-            # Get filepath from --print output
             filepath = None
             for line in result.stdout.strip().split('\n'):
                 line = line.strip()
@@ -131,23 +133,21 @@ def download_video():
                     filepath = line
                     break
 
-            # Fallback: find newest file
             if not filepath:
                 filepath = find_newest('.mp3' if is_mp3 else '.mp4')
 
             if not filepath or not os.path.exists(filepath):
                 last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'File not found'
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
 
             file_size = os.path.getsize(filepath)
             if file_size < 10000:
                 os.remove(filepath)
-                last_error = 'File too small, retrying...'
-                time.sleep(1)
+                last_error = 'File too small'
+                time.sleep(0.5)
                 continue
 
-            # Success - stream file to browser
             mimetype      = 'audio/mpeg' if is_mp3 else 'video/mp4'
             download_name = os.path.basename(filepath)
             cleanup(filepath)
@@ -155,7 +155,7 @@ def download_video():
             def generate(path):
                 with open(path, 'rb') as f:
                     while True:
-                        chunk = f.read(1024 * 1024)  # 1MB chunks
+                        chunk = f.read(1024 * 1024)
                         if not chunk:
                             break
                         yield chunk
@@ -172,10 +172,10 @@ def download_video():
             )
 
         except subprocess.TimeoutExpired:
-            last_error = 'Download timed out'
+            last_error = 'Timed out'
         except Exception as e:
             last_error = str(e)
-        time.sleep(1)
+        time.sleep(0.5)
 
     return jsonify({'error': last_error}), 500
 
