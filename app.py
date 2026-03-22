@@ -1,12 +1,14 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import os, tempfile, threading, time, subprocess, json, glob
+import os, tempfile, threading, time, subprocess, json, glob, schedule
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
 DOWNLOAD_DIR = tempfile.mkdtemp()
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+YT_EMAIL    = os.environ.get('YT_EMAIL', '')
+YT_PASSWORD = os.environ.get('YT_PASSWORD', '')
 
 FORMATS = {
     '1080': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best',
@@ -21,6 +23,100 @@ PLAYER_CLIENTS = [
     'tv_embedded,web', 'mweb,android', 'web_creator,android',
 ]
 
+# ─── AUTO COOKIE REFRESH ──────────────────────────────────────────────────────
+
+def refresh_cookies():
+    """Use Playwright to log into YouTube and export fresh cookies"""
+    if not YT_EMAIL or not YT_PASSWORD:
+        print('[cookies] No YT_EMAIL/YT_PASSWORD set — skipping auto refresh')
+        return False
+    try:
+        print('[cookies] Starting auto cookie refresh...')
+        script = f"""
+import asyncio
+from playwright.async_api import async_playwright
+
+async def get_cookies():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=[
+            '--no-sandbox', '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage', '--disable-gpu'
+        ])
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = await context.new_page()
+
+        # Go to YouTube login
+        await page.goto('https://accounts.google.com/signin/v2/identifier?service=youtube', timeout=30000)
+        await page.wait_for_timeout(2000)
+
+        # Enter email
+        await page.fill('input[type="email"]', '{YT_EMAIL}')
+        await page.click('#identifierNext')
+        await page.wait_for_timeout(3000)
+
+        # Enter password
+        await page.fill('input[type="password"]', '{YT_PASSWORD}')
+        await page.click('#passwordNext')
+        await page.wait_for_timeout(5000)
+
+        # Navigate to YouTube
+        await page.goto('https://www.youtube.com', timeout=30000)
+        await page.wait_for_timeout(3000)
+
+        # Export cookies in Netscape format
+        cookies = await context.cookies(['https://www.youtube.com'])
+        lines = ['# Netscape HTTP Cookie File']
+        for c in cookies:
+            domain = c['domain']
+            flag = 'TRUE' if domain.startswith('.') else 'FALSE'
+            secure = 'TRUE' if c.get('secure') else 'FALSE'
+            expiry = int(c.get('expires', 0)) if c.get('expires') else 0
+            name = c['name']
+            value = c['value']
+            path = c.get('path', '/')
+            lines.append(f'{{domain}}\\t{{flag}}\\t{{path}}\\t{{secure}}\\t{{expiry}}\\t{{name}}\\t{{value}}')
+
+        with open('{COOKIES_FILE}', 'w') as f:
+            f.write('\\n'.join(lines))
+
+        await browser.close()
+        print('[cookies] Cookie refresh successful!')
+
+asyncio.run(get_cookies())
+"""
+        result = subprocess.run(['python3', '-c', script],
+                                capture_output=True, text=True, timeout=120)
+        if result.returncode == 0 and os.path.exists(COOKIES_FILE):
+            size = os.path.getsize(COOKIES_FILE)
+            print(f'[cookies] Saved {size} bytes to cookies.txt')
+            return True
+        else:
+            print(f'[cookies] Refresh failed: {result.stderr[-300:]}')
+            return False
+    except Exception as e:
+        print(f'[cookies] Exception: {e}')
+        return False
+
+
+def cookie_scheduler():
+    """Run cookie refresh every 12 hours"""
+    # Refresh immediately on startup if no cookies
+    if not os.path.exists(COOKIES_FILE):
+        refresh_cookies()
+    # Then every 12 hours
+    schedule.every(12).hours.do(refresh_cookies)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+
+# Start cookie refresh thread on startup
+threading.Thread(target=cookie_scheduler, daemon=True).start()
+
+# ─── YT-DLP HELPERS ──────────────────────────────────────────────────────────
+
 def base_args(attempt=0):
     args = [
         'yt-dlp',
@@ -33,6 +129,7 @@ def base_args(attempt=0):
         '--concurrent-fragments', '8',
         '--no-check-certificate',
         '--extractor-args', f'youtube:player_client={PLAYER_CLIENTS[attempt % len(PLAYER_CLIENTS)]}',
+        '--extractor-args', 'youtube:player_skip=webpage,configs',
         '--add-header', 'Accept-Language:en-US,en;q=0.9',
     ]
     if os.path.exists(COOKIES_FILE):
@@ -46,19 +143,29 @@ def cleanup(path, delay=180):
         except: pass
     threading.Thread(target=_del, daemon=True).start()
 
-def safe_name(t, n=80):
-    return "".join(c for c in t if c.isalnum() or c in " -_()[]").strip()[:n] or 'video'
 
+# ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 @app.route('/health')
 def health():
-    # Also shows yt-dlp version to confirm it's installed
     try:
         v = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True, timeout=5)
         version = v.stdout.strip()
     except:
         version = 'not found'
-    return jsonify({'status': 'ok', 'yt_dlp': version, 'cookies': os.path.exists(COOKIES_FILE)})
+    return jsonify({
+        'status': 'ok',
+        'yt_dlp': version,
+        'cookies': os.path.exists(COOKIES_FILE),
+        'auto_refresh': bool(YT_EMAIL),
+    })
+
+
+@app.route('/api/refresh-cookies', methods=['POST'])
+def manual_refresh():
+    """Manual trigger to refresh cookies"""
+    success = refresh_cookies()
+    return jsonify({'success': success})
 
 
 @app.route('/api/info', methods=['POST'])
@@ -88,14 +195,16 @@ def get_info():
                     'uploader': info.get('uploader', 'Unknown'),
                     'available_heights': heights[:8],
                 })
-            # capture actual error from stderr
             if result.stderr:
                 last_error = result.stderr.strip().split('\n')[-1]
+                # If bot error, try refreshing cookies immediately
+                if 'Sign in' in last_error or 'bot' in last_error.lower():
+                    threading.Thread(target=refresh_cookies, daemon=True).start()
         except subprocess.TimeoutExpired:
-            last_error = 'Timeout fetching info'
+            last_error = 'Timeout - try again'
         except Exception as e:
             last_error = str(e)
-        time.sleep(2)
+        time.sleep(1)
 
     return jsonify({'error': last_error}), 400
 
@@ -110,8 +219,7 @@ def download_video():
 
     fmt = FORMATS.get(quality, FORMATS['1080'])
     is_mp3 = quality == 'mp3'
-    # Use video title in filename directly via yt-dlp template
-    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s_%(height)s.%(ext)s') if not is_mp3 else os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
+    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
 
     last_error = 'Download failed'
     for attempt in range(6):
@@ -119,23 +227,27 @@ def download_video():
             args = base_args(attempt) + [
                 '--format', fmt,
                 '--output', out_tmpl,
-                '--print', 'after_move:filepath',  # prints final filepath after download+merge
+                '--print', 'after_move:filepath',
             ]
-
             if is_mp3:
-                args += [
-                    '--extract-audio',
-                    '--audio-format', 'mp3',
-                    '--audio-quality', '0',
-                ]
+                args += ['--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0']
             else:
                 args += ['--merge-output-format', 'mp4']
 
             args.append(url)
-
             result = subprocess.run(args, capture_output=True, text=True, timeout=600)
 
-            # --print filepath gives us the exact output file path
+            # Auto refresh cookies if bot detected
+            if result.returncode != 0 and result.stderr:
+                err = result.stderr.strip().split('\n')[-1]
+                if 'Sign in' in err or 'bot' in err.lower():
+                    print('[cookies] Bot detected — refreshing cookies...')
+                    refresh_cookies()
+                last_error = err
+                time.sleep(2)
+                continue
+
+            # Get filepath from --print output
             filepath = None
             for line in result.stdout.strip().split('\n'):
                 line = line.strip()
@@ -143,7 +255,7 @@ def download_video():
                     filepath = line
                     break
 
-            # fallback: find newest file
+            # Fallback: newest file
             if not filepath:
                 ext = '.mp3' if is_mp3 else '.mp4'
                 matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
@@ -151,13 +263,13 @@ def download_video():
                     filepath = max(matches, key=os.path.getmtime)
 
             if not filepath or not os.path.exists(filepath):
-                last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'File not found'
+                last_error = 'File not found after download'
                 time.sleep(2)
                 continue
 
             file_size = os.path.getsize(filepath)
             if file_size < 10000:
-                last_error = 'Downloaded file too small — likely failed'
+                last_error = 'File too small'
                 os.remove(filepath)
                 time.sleep(2)
                 continue
@@ -169,7 +281,7 @@ def download_video():
             def generate(path):
                 with open(path, 'rb') as f:
                     while True:
-                        chunk = f.read(512 * 1024)
+                        chunk = f.read(1024 * 1024)
                         if not chunk:
                             break
                         yield chunk
@@ -186,10 +298,10 @@ def download_video():
             )
 
         except subprocess.TimeoutExpired:
-            last_error = 'Download timed out'
+            last_error = 'Timed out'
         except Exception as e:
             last_error = str(e)
-        time.sleep(2)
+        time.sleep(1.5)
 
     return jsonify({'error': last_error}), 500
 
