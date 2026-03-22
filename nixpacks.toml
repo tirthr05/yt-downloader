@@ -3,7 +3,7 @@ nixPkgs = ["python311", "ffmpeg", "chromium", "chromium-driver"]
 
 [phases.install]
 cmds = [
-  "pip install flask flask-cors schedule",
+  "pip install flask flask-cors",
   "pip install -U yt-dlp",
   "pip install playwright",
   "playwright install chromium",
