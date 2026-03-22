@@ -1,8 +1,14 @@
 [phases.setup]
-nixPkgs = ["python311", "ffmpeg", "yt-dlp"]
- 
+nixPkgs = ["python311", "ffmpeg", "chromium", "chromium-driver"]
+
 [phases.install]
-cmds = ["pip install flask flask-cors"]
- 
+cmds = [
+  "pip install flask flask-cors schedule",
+  "pip install -U yt-dlp",
+  "pip install playwright",
+  "playwright install chromium",
+  "playwright install-deps chromium"
+]
+
 [start]
 cmd = "python app.py"
