@@ -1,137 +1,96 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import yt_dlp
-import os
-import tempfile
-import threading
-import time
-import random
+import os, tempfile, threading, time, subprocess, json, glob, random
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
 DOWNLOAD_DIR = tempfile.mkdtemp()
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-    'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
-    'com.google.android.youtube/17.36.4 (Linux; U; Android 12) gzip',
-]
-
-PLAYER_STRATEGIES = [
-    ['android', 'web'],
-    ['ios', 'web'],
-    ['android_vr'],
-    ['tv_embedded', 'web'],
-    ['mweb', 'android'],
-    ['web_creator', 'android'],
-]
-
-# STRICT quality map - video and audio are downloaded SEPARATELY then merged by ffmpeg
-# This guarantees exact resolution - no combined streams which cap at 720p on YouTube
-QUALITY_HEIGHT = {
-    '1080': 1080,
-    '1440': 1440,
-    '2160': 2160,
-    'best': 9999,
+# STRICT format map — separate video+audio streams, exact resolution
+# YouTube ONLY serves 1080p/2K/4K as DASH streams (separate video+audio)
+# yt-dlp merges them with ffmpeg into a single mp4
+FORMATS = {
+    '1080': 'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=1080]+bestaudio[ext=m4a]/bestvideo[height=1080]+bestaudio',
+    '1440': 'bestvideo[height=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=1440]+bestaudio[ext=m4a]/bestvideo[height=1440]+bestaudio',
+    '2160': 'bestvideo[height=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=2160]+bestaudio[ext=m4a]/bestvideo[height=2160]+bestaudio',
+    'best': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio',
+    'mp3':  'bestaudio[ext=m4a]/bestaudio/best',
 }
 
-def get_format(quality):
-    if quality == 'mp3':
-        return 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
-    h = QUALITY_HEIGHT.get(quality, 1080)
-    if quality == 'best':
-        return (
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
-            'bestvideo+bestaudio/best'
-        )
-    return (
-        # Exact height mp4 preferred
-        f'bestvideo[height={h}][ext=mp4]+bestaudio[ext=m4a]/'
-        # Exact height any container
-        f'bestvideo[height={h}]+bestaudio[ext=m4a]/'
-        f'bestvideo[height={h}]+bestaudio/'
-        # Up to height mp4
-        f'bestvideo[height<={h}][height>={h-10}][ext=mp4]+bestaudio[ext=m4a]/'
-        f'bestvideo[height<={h}][height>={h-10}]+bestaudio/'
-        # Relaxed up to height
-        f'bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/'
-        f'bestvideo[height<={h}]+bestaudio/'
-        f'best[height<={h}]'
-    )
+PLAYER_CLIENTS = [
+    'android,web',
+    'ios,web',
+    'android_vr',
+    'tv_embedded,web',
+    'mweb,android',
+    'web_creator,android',
+]
 
-def get_opts(attempt=0):
-    return {
-        'quiet': True,
-        'no_warnings': True,
-        'user_agent': random.choice(USER_AGENTS),
-        'extractor_args': {
-            'youtube': {
-                'player_client': PLAYER_STRATEGIES[attempt % len(PLAYER_STRATEGIES)],
-            }
-        },
-        'http_headers': {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        'retries': 10,
-        'fragment_retries': 10,
-        'geo_bypass': True,
-        'geo_bypass_country': 'US',
-        'concurrent_fragment_downloads': 8,
-        'http_chunk_size': 10485760,
-    }
+def base_args(attempt=0):
+    args = [
+        'yt-dlp',
+        '--no-warnings',
+        '--no-playlist',
+        '--geo-bypass',
+        '--geo-bypass-country', 'US',
+        '--retries', '10',
+        '--fragment-retries', '10',
+        '--concurrent-fragments', '8',
+        '--no-check-certificate',
+        '--extractor-args', f'youtube:player_client={PLAYER_CLIENTS[attempt % len(PLAYER_CLIENTS)]}',
+        '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    ]
+    if os.path.exists(COOKIES_FILE):
+        args += ['--cookies', COOKIES_FILE]
+    return args
 
-def cleanup_file(path, delay=180):
-    def _delete():
+def cleanup(path, delay=180):
+    def _del():
         time.sleep(delay)
-        try:
-            os.remove(path)
-        except:
-            pass
-    threading.Thread(target=_delete, daemon=True).start()
+        try: os.remove(path)
+        except: pass
+    threading.Thread(target=_del, daemon=True).start()
 
-def find_file(directory, video_id, ext):
-    """Find downloaded file by video_id and extension"""
-    for f in sorted(os.listdir(directory), key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True):
-        if video_id in f and f.endswith(ext):
-            return os.path.join(directory, f)
-    # fallback: most recently modified file with that ext
-    candidates = [f for f in os.listdir(directory) if f.endswith(ext)]
-    if candidates:
-        candidates.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True)
-        return os.path.join(directory, candidates[0])
+def safe_name(t, n=80):
+    return "".join(c for c in t if c.isalnum() or c in " -_()[]").strip()[:n]
+
+def find_file(vid_id, ext):
+    # find most recently modified file matching video id and extension
+    matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{vid_id}*{ext}'))
+    if matches:
+        return max(matches, key=os.path.getmtime)
+    # fallback: any recent file with that ext
+    matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
+    if matches:
+        return max(matches, key=os.path.getmtime)
     return None
 
-def safe_title(title, max_len=80):
-    return "".join(c for c in title if c.isalnum() or c in " -_()[]").strip()[:max_len]
 
-
-@app.route('/health', methods=['GET'])
+@app.route('/health')
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'cookies': os.path.exists(COOKIES_FILE)})
 
 
 @app.route('/api/info', methods=['POST'])
 def get_info():
-    data = request.json
-    url = data.get('url', '').strip()
+    url = (request.json or {}).get('url', '').strip()
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    last_error = None
     for attempt in range(6):
         try:
-            with yt_dlp.YoutubeDL(get_opts(attempt)) as ydl:
-                info = ydl.extract_info(url, download=False)
-                # Find the best available resolutions for this video
+            result = subprocess.run(
+                base_args(attempt) + ['--dump-json', '--skip-download', url],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info = json.loads(result.stdout.strip().split('\n')[0])
                 formats = info.get('formats', [])
                 heights = sorted(set(
                     f.get('height') for f in formats
-                    if f.get('height') and f.get('vcodec') != 'none'
+                    if f.get('height') and f.get('vcodec') not in (None, 'none')
                 ), reverse=True)
                 return jsonify({
                     'title': info.get('title', 'Unknown'),
@@ -141,76 +100,110 @@ def get_info():
                     'available_heights': heights[:8],
                 })
         except Exception as e:
-            last_error = str(e)
-            time.sleep(1)
+            pass
+        time.sleep(1.5)
 
-    return jsonify({'error': last_error}), 400
+    return jsonify({'error': 'Could not fetch video info. Try again.'}), 400
 
 
 @app.route('/api/download', methods=['POST'])
 def download_video():
-    data = request.json
-    url = data.get('url', '').strip()
-    quality = data.get('quality', '1080')
+    url = (request.json or {}).get('url', '').strip()
+    quality = (request.json or {}).get('quality', '1080')
 
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    fmt = get_format(quality)
+    fmt = FORMATS.get(quality, FORMATS['1080'])
     is_mp3 = quality == 'mp3'
+    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(id)s_%(height)s.%(ext)s')
 
-    if is_mp3:
-        out_tmpl = os.path.join(DOWNLOAD_DIR, '%(id)s_audio.%(ext)s')
-        extra = {
-            'format': fmt,
-            'outtmpl': out_tmpl,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }],
-        }
-    else:
-        out_tmpl = os.path.join(DOWNLOAD_DIR, '%(id)s_%(height)sp.%(ext)s')
-        extra = {
-            'format': fmt,
-            'outtmpl': out_tmpl,
-            'merge_output_format': 'mp4',
-        }
-
-    last_error = None
+    last_error = 'Unknown error'
     for attempt in range(6):
         try:
-            ydl_opts = {**get_opts(attempt), **extra}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-
-            video_id = info.get('id', 'video')
-            actual_height = info.get('height') or quality
-            title = safe_title(info.get('title', video_id))
+            args = base_args(attempt) + [
+                '--format', fmt,
+                '--merge-output-format', 'mp4' if not is_mp3 else 'mp4',
+                '--output', out_tmpl,
+            ]
 
             if is_mp3:
-                filepath = find_file(DOWNLOAD_DIR, video_id, '.mp3')
+                args += [
+                    '--extract-audio',
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '0',  # 0 = best quality (VBR ~320kbps)
+                ]
+
+            args.append(url)
+
+            result = subprocess.run(args, capture_output=True, text=True, timeout=600)
+
+            if result.returncode != 0:
+                last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'yt-dlp failed'
+                time.sleep(2)
+                continue
+
+            # Get video ID from yt-dlp output
+            vid_id = None
+            for line in result.stderr.split('\n') + result.stdout.split('\n'):
+                if 'Destination:' in line or '[download]' in line:
+                    # extract id from filename
+                    pass
+
+            # Find the output file
+            ext = '.mp3' if is_mp3 else '.mp4'
+
+            # Most reliable: get the newest file in DOWNLOAD_DIR
+            all_files = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
+            if not all_files:
+                last_error = 'File not found after download'
+                time.sleep(2)
+                continue
+
+            filepath = max(all_files, key=os.path.getmtime)
+            file_size = os.path.getsize(filepath)
+
+            if file_size < 10000:
+                last_error = 'Downloaded file too small'
+                os.remove(filepath)
+                time.sleep(2)
+                continue
+
+            # Get actual resolution from filename
+            basename = os.path.basename(filepath)
+            # Try to extract height from filename like id_1080.mp4
+            actual_height = quality
+            parts = basename.replace('.mp4','').replace('.mp3','').split('_')
+            for p in parts:
+                if p.isdigit() and int(p) > 100:
+                    actual_height = p
+                    break
+
+            # Build clean download filename
+            # Re-fetch title quickly
+            try:
+                info_result = subprocess.run(
+                    base_args(0) + ['--dump-json', '--skip-download', url],
+                    capture_output=True, text=True, timeout=15
+                )
+                info = json.loads(info_result.stdout.strip().split('\n')[0])
+                title = safe_name(info.get('title', 'video'))
+            except:
+                title = 'video'
+
+            if is_mp3:
                 download_name = f"{title}.mp3"
                 mimetype = 'audio/mpeg'
             else:
-                filepath = find_file(DOWNLOAD_DIR, video_id, '.mp4')
                 download_name = f"{title}_{actual_height}p.mp4"
                 mimetype = 'video/mp4'
 
-            if not filepath:
-                raise Exception('Downloaded file not found on disk')
-
-            actual_size = os.path.getsize(filepath)
-            if actual_size < 1000:
-                raise Exception('Downloaded file is too small, likely corrupt')
-
-            cleanup_file(filepath, delay=180)
+            cleanup(filepath, delay=180)
 
             def generate(path):
                 with open(path, 'rb') as f:
                     while True:
-                        chunk = f.read(512 * 1024)  # 512KB chunks
+                        chunk = f.read(512 * 1024)
                         if not chunk:
                             break
                         yield chunk
@@ -220,15 +213,17 @@ def download_video():
                 mimetype=mimetype,
                 headers={
                     'Content-Disposition': f'attachment; filename="{download_name}"',
-                    'Content-Length': str(actual_size),
+                    'Content-Length': str(file_size),
                     'X-Accel-Buffering': 'no',
                     'Cache-Control': 'no-cache',
                 }
             )
 
+        except subprocess.TimeoutExpired:
+            last_error = 'Download timed out'
         except Exception as e:
             last_error = str(e)
-            time.sleep(1.5)
+        time.sleep(1.5)
 
     return jsonify({'error': last_error}), 500
 
