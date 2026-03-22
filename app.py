@@ -23,7 +23,6 @@ USER_AGENTS = [
     'com.google.android.youtube/17.36.4 (Linux; U; Android 12) gzip',
 ]
 
-# Each attempt uses a different player client strategy
 PLAYER_STRATEGIES = [
     ['android', 'web'],
     ['ios', 'web'],
@@ -32,6 +31,36 @@ PLAYER_STRATEGIES = [
     ['mweb', 'android'],
     ['web_creator', 'android'],
 ]
+
+# Format strings per quality — strict to loose fallback chain
+FORMAT_MAP = {
+    '1080': (
+        'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1080]+bestaudio/'
+        'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1080]+bestaudio/'
+        'best[height<=1080]'
+    ),
+    '1440': (
+        'bestvideo[height=1440][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1440]+bestaudio/'
+        'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1440]+bestaudio/'
+        'best[height<=1440]'
+    ),
+    '2160': (
+        'bestvideo[height=2160][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=2160]+bestaudio/'
+        'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=2160]+bestaudio/'
+        'best[height<=2160]'
+    ),
+    'best': (
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo+bestaudio/'
+        'best'
+    ),
+}
 
 def get_opts(attempt=0):
     strategy = PLAYER_STRATEGIES[attempt % len(PLAYER_STRATEGIES)]
@@ -53,12 +82,11 @@ def get_opts(attempt=0):
         'fragment_retries': 10,
         'sleep_interval': 1,
         'max_sleep_interval': 4,
-        'ignoreerrors': False,
         'geo_bypass': True,
         'geo_bypass_country': 'US',
     }
 
-def cleanup_file(path, delay=120):
+def cleanup_file(path, delay=180):
     def _delete():
         time.sleep(delay)
         try:
@@ -108,12 +136,12 @@ def download_video():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
-    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
+    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(id)s_%(height)s.%(ext)s')
 
     if quality == 'mp3':
         extra = {
-            'format': 'bestaudio/best',
-            'outtmpl': out_tmpl,
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -121,15 +149,7 @@ def download_video():
             }],
         }
     else:
-        if quality == 'best':
-            fmt = 'bestvideo+bestaudio/best'
-        else:
-            fmt = (
-                f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
-                f'bestvideo[height<={quality}]+bestaudio/'
-                f'best[height<={quality}]/'
-                f'best'
-            )
+        fmt = FORMAT_MAP.get(quality, FORMAT_MAP['best'])
         extra = {
             'format': fmt,
             'outtmpl': out_tmpl,
@@ -143,13 +163,29 @@ def download_video():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
 
-                safe_title = ydl.prepare_filename(info)
+                video_id = info.get('id', 'video')
+                height = info.get('height', quality)
+
                 if quality == 'mp3':
-                    filepath = os.path.splitext(safe_title)[0] + '.mp3'
-                else:
-                    filepath = os.path.splitext(safe_title)[0] + '.mp4'
+                    filepath = os.path.join(DOWNLOAD_DIR, f'{video_id}.mp3')
+                    # fallback: search for any mp3 with this id
                     if not os.path.exists(filepath):
-                        filepath = safe_title
+                        for f in os.listdir(DOWNLOAD_DIR):
+                            if f.startswith(video_id) and f.endswith('.mp3'):
+                                filepath = os.path.join(DOWNLOAD_DIR, f)
+                                break
+                    download_name = f"{info.get('title', video_id)}.mp3"
+                    mimetype = 'audio/mpeg'
+                else:
+                    filepath = os.path.join(DOWNLOAD_DIR, f'{video_id}_{height}.mp4')
+                    # fallback: search for any mp4 with this id
+                    if not os.path.exists(filepath):
+                        for f in os.listdir(DOWNLOAD_DIR):
+                            if f.startswith(video_id) and f.endswith('.mp4'):
+                                filepath = os.path.join(DOWNLOAD_DIR, f)
+                                break
+                    download_name = f"{info.get('title', video_id)}_{height}p.mp4"
+                    mimetype = 'video/mp4'
 
                 if not os.path.exists(filepath):
                     raise Exception('File not found after download')
@@ -159,8 +195,8 @@ def download_video():
                 return send_file(
                     filepath,
                     as_attachment=True,
-                    download_name=os.path.basename(filepath),
-                    mimetype='audio/mpeg' if quality == 'mp3' else 'video/mp4'
+                    download_name=download_name,
+                    mimetype=mimetype
                 )
 
         except Exception as e:
