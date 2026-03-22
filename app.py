@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import os, tempfile, threading, time, subprocess, json, glob, schedule
+import os, tempfile, threading, time, subprocess, json, glob
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -101,15 +101,14 @@ asyncio.run(get_cookies())
 
 
 def cookie_scheduler():
-    """Run cookie refresh every 12 hours"""
+    """Run cookie refresh every 12 hours using plain threading"""
     # Refresh immediately on startup if no cookies
     if not os.path.exists(COOKIES_FILE):
         refresh_cookies()
-    # Then every 12 hours
-    schedule.every(12).hours.do(refresh_cookies)
+    # Then sleep 12 hours and repeat
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        time.sleep(12 * 60 * 60)
+        refresh_cookies()
 
 
 # Start cookie refresh thread on startup
