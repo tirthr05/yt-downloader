@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import os, tempfile, threading, time, subprocess, json, glob, random
+import os, tempfile, threading, time, subprocess, json, glob
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -8,24 +8,17 @@ CORS(app, origins="*")
 DOWNLOAD_DIR = tempfile.mkdtemp()
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
-# STRICT format map — separate video+audio streams, exact resolution
-# YouTube ONLY serves 1080p/2K/4K as DASH streams (separate video+audio)
-# yt-dlp merges them with ffmpeg into a single mp4
 FORMATS = {
-    '1080': 'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=1080]+bestaudio[ext=m4a]/bestvideo[height=1080]+bestaudio',
-    '1440': 'bestvideo[height=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=1440]+bestaudio[ext=m4a]/bestvideo[height=1440]+bestaudio',
-    '2160': 'bestvideo[height=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=2160]+bestaudio[ext=m4a]/bestvideo[height=2160]+bestaudio',
-    'best': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio',
-    'mp3':  'bestaudio[ext=m4a]/bestaudio/best',
+    '1080': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best',
+    '1440': 'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best',
+    '2160': 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best',
+    'best': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+    'mp3':  'bestaudio/best',
 }
 
 PLAYER_CLIENTS = [
-    'android,web',
-    'ios,web',
-    'android_vr',
-    'tv_embedded,web',
-    'mweb,android',
-    'web_creator,android',
+    'android,web', 'ios,web', 'android_vr',
+    'tv_embedded,web', 'mweb,android', 'web_creator,android',
 ]
 
 def base_args(attempt=0):
@@ -54,23 +47,18 @@ def cleanup(path, delay=180):
     threading.Thread(target=_del, daemon=True).start()
 
 def safe_name(t, n=80):
-    return "".join(c for c in t if c.isalnum() or c in " -_()[]").strip()[:n]
-
-def find_file(vid_id, ext):
-    # find most recently modified file matching video id and extension
-    matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{vid_id}*{ext}'))
-    if matches:
-        return max(matches, key=os.path.getmtime)
-    # fallback: any recent file with that ext
-    matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
-    if matches:
-        return max(matches, key=os.path.getmtime)
-    return None
+    return "".join(c for c in t if c.isalnum() or c in " -_()[]").strip()[:n] or 'video'
 
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'cookies': os.path.exists(COOKIES_FILE)})
+    # Also shows yt-dlp version to confirm it's installed
+    try:
+        v = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True, timeout=5)
+        version = v.stdout.strip()
+    except:
+        version = 'not found'
+    return jsonify({'status': 'ok', 'yt_dlp': version, 'cookies': os.path.exists(COOKIES_FILE)})
 
 
 @app.route('/api/info', methods=['POST'])
@@ -79,11 +67,12 @@ def get_info():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
 
+    last_error = 'Failed to fetch info'
     for attempt in range(6):
         try:
             result = subprocess.run(
                 base_args(attempt) + ['--dump-json', '--skip-download', url],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=40
             )
             if result.returncode == 0 and result.stdout.strip():
                 info = json.loads(result.stdout.strip().split('\n')[0])
@@ -99,11 +88,16 @@ def get_info():
                     'uploader': info.get('uploader', 'Unknown'),
                     'available_heights': heights[:8],
                 })
+            # capture actual error from stderr
+            if result.stderr:
+                last_error = result.stderr.strip().split('\n')[-1]
+        except subprocess.TimeoutExpired:
+            last_error = 'Timeout fetching info'
         except Exception as e:
-            pass
-        time.sleep(1.5)
+            last_error = str(e)
+        time.sleep(2)
 
-    return jsonify({'error': 'Could not fetch video info. Try again.'}), 400
+    return jsonify({'error': last_error}), 400
 
 
 @app.route('/api/download', methods=['POST'])
@@ -116,89 +110,61 @@ def download_video():
 
     fmt = FORMATS.get(quality, FORMATS['1080'])
     is_mp3 = quality == 'mp3'
-    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(id)s_%(height)s.%(ext)s')
+    # Use video title in filename directly via yt-dlp template
+    out_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s_%(height)s.%(ext)s') if not is_mp3 else os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
 
-    last_error = 'Unknown error'
+    last_error = 'Download failed'
     for attempt in range(6):
         try:
             args = base_args(attempt) + [
                 '--format', fmt,
-                '--merge-output-format', 'mp4' if not is_mp3 else 'mp4',
                 '--output', out_tmpl,
+                '--print', 'after_move:filepath',  # prints final filepath after download+merge
             ]
 
             if is_mp3:
                 args += [
                     '--extract-audio',
                     '--audio-format', 'mp3',
-                    '--audio-quality', '0',  # 0 = best quality (VBR ~320kbps)
+                    '--audio-quality', '0',
                 ]
+            else:
+                args += ['--merge-output-format', 'mp4']
 
             args.append(url)
 
             result = subprocess.run(args, capture_output=True, text=True, timeout=600)
 
-            if result.returncode != 0:
-                last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'yt-dlp failed'
+            # --print filepath gives us the exact output file path
+            filepath = None
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if line and os.path.exists(line):
+                    filepath = line
+                    break
+
+            # fallback: find newest file
+            if not filepath:
+                ext = '.mp3' if is_mp3 else '.mp4'
+                matches = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
+                if matches:
+                    filepath = max(matches, key=os.path.getmtime)
+
+            if not filepath or not os.path.exists(filepath):
+                last_error = result.stderr.strip().split('\n')[-1] if result.stderr else 'File not found'
                 time.sleep(2)
                 continue
 
-            # Get video ID from yt-dlp output
-            vid_id = None
-            for line in result.stderr.split('\n') + result.stdout.split('\n'):
-                if 'Destination:' in line or '[download]' in line:
-                    # extract id from filename
-                    pass
-
-            # Find the output file
-            ext = '.mp3' if is_mp3 else '.mp4'
-
-            # Most reliable: get the newest file in DOWNLOAD_DIR
-            all_files = glob.glob(os.path.join(DOWNLOAD_DIR, f'*{ext}'))
-            if not all_files:
-                last_error = 'File not found after download'
-                time.sleep(2)
-                continue
-
-            filepath = max(all_files, key=os.path.getmtime)
             file_size = os.path.getsize(filepath)
-
             if file_size < 10000:
-                last_error = 'Downloaded file too small'
+                last_error = 'Downloaded file too small — likely failed'
                 os.remove(filepath)
                 time.sleep(2)
                 continue
 
-            # Get actual resolution from filename
-            basename = os.path.basename(filepath)
-            # Try to extract height from filename like id_1080.mp4
-            actual_height = quality
-            parts = basename.replace('.mp4','').replace('.mp3','').split('_')
-            for p in parts:
-                if p.isdigit() and int(p) > 100:
-                    actual_height = p
-                    break
-
-            # Build clean download filename
-            # Re-fetch title quickly
-            try:
-                info_result = subprocess.run(
-                    base_args(0) + ['--dump-json', '--skip-download', url],
-                    capture_output=True, text=True, timeout=15
-                )
-                info = json.loads(info_result.stdout.strip().split('\n')[0])
-                title = safe_name(info.get('title', 'video'))
-            except:
-                title = 'video'
-
-            if is_mp3:
-                download_name = f"{title}.mp3"
-                mimetype = 'audio/mpeg'
-            else:
-                download_name = f"{title}_{actual_height}p.mp4"
-                mimetype = 'video/mp4'
-
-            cleanup(filepath, delay=180)
+            download_name = os.path.basename(filepath)
+            mimetype = 'audio/mpeg' if is_mp3 else 'video/mp4'
+            cleanup(filepath)
 
             def generate(path):
                 with open(path, 'rb') as f:
@@ -223,7 +189,7 @@ def download_video():
             last_error = 'Download timed out'
         except Exception as e:
             last_error = str(e)
-        time.sleep(1.5)
+        time.sleep(2)
 
     return jsonify({'error': last_error}), 500
 
