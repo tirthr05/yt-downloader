@@ -11,11 +11,54 @@ YT_EMAIL    = os.environ.get('YT_EMAIL', '')
 YT_PASSWORD = os.environ.get('YT_PASSWORD', '')
 
 FORMATS = {
-    '1080': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best',
-    '1440': 'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best',
-    '2160': 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best',
-    'best': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
-    'mp3':  'bestaudio/best',
+    # Sort by fps DESC so 60fps is preferred over 30fps at same resolution
+    # bestvideo[height=X] picks highest fps automatically when sorted
+    '1080': (
+        # Best fps at exactly 1080p mp4
+        'bestvideo[height=1080][fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1080][fps>=50][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1080][fps>=60]+bestaudio/'
+        'bestvideo[height=1080]+bestaudio/'
+        # Fallback: best up to 1080p
+        'bestvideo[height<=1080][fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1080]+bestaudio/'
+        # Last resort: absolute best
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo+bestaudio/best'
+    ),
+    '1440': (
+        'bestvideo[height=1440][fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1440][fps>=50][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1440][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=1440][fps>=60]+bestaudio/'
+        'bestvideo[height=1440]+bestaudio/'
+        'bestvideo[height<=1440][fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1440]+bestaudio/'
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo+bestaudio/best'
+    ),
+    '2160': (
+        'bestvideo[height=2160][fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=2160][fps>=50][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=2160][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height=2160][fps>=60]+bestaudio/'
+        'bestvideo[height=2160]+bestaudio/'
+        'bestvideo[height<=2160][fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=2160]+bestaudio/'
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo+bestaudio/best'
+    ),
+    'best': (
+        'bestvideo[fps>=60][ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+        'bestvideo[fps>=60]+bestaudio/'
+        'bestvideo+bestaudio/best'
+    ),
+    'mp3': 'bestaudio/best',
 }
 
 PLAYER_CLIENTS = [
